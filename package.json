@@ -1,9 +1,8 @@
 {
   "name": "store-business-logic",
   "version": "1.0.0",
-  "description": "Store Telegram Mini App business logic function",
-  "main": "main.js",
-  "type": "module",
+  "description": "Business logic function for Store Telegram Mini App",
+  "main": "src/index.js",
   "dependencies": {
     "node-appwrite": "^13.0.0"
   }
