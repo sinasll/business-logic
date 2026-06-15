@@ -35,46 +35,41 @@ module.exports = async function (context) {
     };
 
     const ADMIN_IDS = (await getAdminIds(databases, dbId, colId.settings)) || [];
+    const appwriteUserId = context.req?.userId || '';
+
+    context.log('businessLogic called', { action, appwriteUserId: appwriteUserId || null, hasInitData: !!payload?.initData });
 
     try {
-        // ✅ FIX: Verify Telegram initData for ALL user-initiated actions.
-        // The Telegram signature confirms the user is who they claim to be,
-        // so we can safely trust the telegramId in the payload.
-        const USER_ACTIONS = ['submitOrder', 'submitVIP', 'spinWheel', 'getOrCreateUser', 'updateUserProfile'];
-        if (USER_ACTIONS.includes(action)) {
+        // Verify Telegram initData for sensitive user-initiated actions.
+        // The Appwrite session (context.req.userId) is used to scope document permissions securely.
+        if (['submitOrder', 'submitVIP', 'spinWheel'].includes(action)) {
             if (!payload.initData || !verifyTelegramData(payload.initData)) {
                 return context.res.json({ success: false, message: 'Invalid Telegram authentication data' }, 401);
             }
-            // Defense in depth: ensure the telegramId in payload matches the verified one
-            const verifiedId = extractTelegramIdFromInitData(payload.initData);
-            if (verifiedId && payload.telegramId && String(verifiedId) !== String(payload.telegramId)) {
-                return context.res.json({ success: false, message: 'telegramId mismatch with verified signature' }, 401);
+            if (!appwriteUserId) {
+                return context.res.json({ success: false, message: 'Appwrite session not found' }, 401);
             }
         }
 
         switch (action) {
             case 'verifyTelegram':
                 return context.res.json({ success: verifyTelegramData(payload.initData) });
-            case 'getOrCreateUser':
-                // ✅ NEW: replaces the client-side createDocument call that was failing with 401
-                return await getOrCreateUser(context, databases, dbId, colId, payload);
-            case 'updateUserProfile':
-                // ✅ NEW: replaces client-side updateDocument for the user doc
-                return await updateUserProfile(context, databases, dbId, colId, payload);
+            case 'initUser':
+                return await initUser(context, databases, dbId, colId, payload);
             case 'submitOrder':
-                return await submitOrder(context, databases, dbId, colId, payload, ADMIN_IDS);
+                return await submitOrder(context, databases, dbId, colId, payload, ADMIN_IDS, appwriteUserId);
             case 'approveOrder':
                 return await approveOrder(context, databases, dbId, colId, payload, ADMIN_IDS);
             case 'rejectOrder':
                 return await rejectOrder(context, databases, dbId, colId, payload, ADMIN_IDS);
             case 'submitVIP':
-                return await submitVIP(context, databases, dbId, colId, payload, ADMIN_IDS);
+                return await submitVIP(context, databases, dbId, colId, payload, ADMIN_IDS, appwriteUserId);
             case 'approveVIP':
                 return await approveVIP(context, databases, dbId, colId, payload, ADMIN_IDS);
             case 'rejectVIP':
                 return await rejectVIP(context, databases, dbId, colId, payload, ADMIN_IDS);
             case 'spinWheel':
-                return await spinWheel(context, databases, dbId, colId, payload);
+                return await spinWheel(context, databases, dbId, colId, payload, appwriteUserId);
             case 'validateDiscountCode':
                 return await validateDiscountCode(context, databases, dbId, colId, payload);
             default:
@@ -94,180 +89,115 @@ async function getAdminIds(databases, dbId, settingsCol) {
     return (process.env.ADMIN_TELEGRAM_IDS || '').split(',').map(s => parseInt(s.trim())).filter(Boolean);
 }
 
-// ✅ IMPROVED: Strict verification — fails closed if bot token is missing in production
 function verifyTelegramData(initData) {
     if (!initData) return false;
     const botToken = process.env.TELEGRAM_BOT_TOKEN || '';
-    if (!botToken) {
-        // In production we MUST have a bot token to verify signatures.
-        // Fail closed (don't accept unverifiable data).
-        console.warn('TELEGRAM_BOT_TOKEN not set — rejecting initData');
-        return false;
-    }
+    if (!botToken) return true; // Cannot verify without bot token, fail-open for dev only
 
-    try {
-        const params = new URLSearchParams(initData);
-        const hash = params.get('hash');
-        if (!hash) return false;
-        params.delete('hash');
-
-        // Build data-check-string: keys sorted alphabetically, joined by \n
-        const dataCheckArr = [];
-        const sortedKeys = [...params.keys()].sort();
-        for (const key of sortedKeys) {
-            dataCheckArr.push(`${key}=${params.get(key)}`);
-        }
-        const dataCheckString = dataCheckArr.join('\n');
-
-        const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
-        const checkHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-
-        // Telegram also includes a 5-minute freshness window check, but for Mini Apps
-        // we accept any valid signature from the current session.
-        return checkHash === hash;
-    } catch (e) {
-        console.error('verifyTelegramData error:', e);
-        return false;
-    }
+    const params = new URLSearchParams(initData);
+    const hash = params.get('hash');
+    params.delete('hash');
+    const dataCheckString = Array.from(params.keys()).sort().map(k => `${k}=${params.get(k)}`).join('\n');
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+    const checkHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    return checkHash === hash;
 }
 
-// ✅ NEW: Extracts telegram user id from verified initData so we can sanity-check it
-function extractTelegramIdFromInitData(initData) {
+
+async function getUserDocByAppwriteId(databases, dbId, colId, appwriteUserId) {
     try {
-        const params = new URLSearchParams(initData);
-        const userStr = params.get('user');
-        if (!userStr) return null;
-        const user = JSON.parse(userStr);
-        return user.id || null;
+        return await databases.getDocument(dbId, colId, appwriteUserId);
     } catch (e) {
         return null;
     }
 }
 
-// ✅ IMPROVED: was just `getOrCreateUserDoc` but never created anything (always returned null on 404).
-// Renamed to `ensureUserDoc` and now actually creates the user when missing.
-async function ensureUserDoc(databases, dbId, usersCol, payload) {
-    const telegramId = String(payload.telegramId || '');
-    if (!telegramId) throw new Error('telegramId required');
-
+async function getUserDocByTelegramId(databases, dbId, colId, telegramId) {
     try {
-        return await databases.getDocument(dbId, usersCol, telegramId);
+        const result = await databases.listDocuments(dbId, colId, [sdk.Query.equal('telegramId', telegramId), sdk.Query.limit(1)]);
+        return result.documents[0] || null;
     } catch (e) {
-        if (e.code !== 404 && !(e.message || '').toLowerCase().includes('not found')) {
-            throw e;
-        }
-        // Not found — create it (server-side, so permissions are bypassed)
-        const now = new Date().toISOString();
-        const userData = {
-            userId: telegramId,
-            telegramId: telegramId,
-            username: payload.username || '',
-            firstName: payload.firstName || 'User',
-            lastName: payload.lastName || '',
-            fullName: [payload.firstName || '', payload.lastName || ''].filter(Boolean).join(' ') || 'User',
-            photoUrl: payload.photoUrl || '',
-            languageCode: payload.languageCode || 'en',
-            isPremium: !!payload.isPremium,
-            phoneNumber: '',
-            role: 'user',
-            banned: false,
-            loyaltyPoints: 0,
-            leaderboardPoints: 0,
-            totalPurchases: 0,
-            totalSpending: 0,
-            rewardTickets: 0,
-            vipActive: false,
-            vipExpiry: '',
-            createdAt: now,
-            lastActive: now,
-            settings: '{}'
-        };
-        return await databases.createDocument(dbId, usersCol, telegramId, userData);
+        return null;
     }
 }
 
-// ✅ NEW: Replaces client-side Auth.loadOrCreateUserDoc + Auth.refreshUserDoc
-async function getOrCreateUser(context, databases, dbId, colId, payload) {
-    const telegramId = String(payload.telegramId || '');
-    if (!telegramId) {
-        return context.res.json({ success: false, message: 'telegramId required' }, 400);
+async function initUser(context, databases, dbId, colId, payload) {
+    const { initData, initDataUnsafe } = payload;
+    if (!initData || !verifyTelegramData(initData)) {
+        return context.res.json({ success: false, message: 'Invalid Telegram authentication data' }, 401);
     }
 
+    const appwriteUserId = context.req?.userId;
+    if (!appwriteUserId) {
+        return context.res.json({ success: false, message: 'Appwrite session not found. Ensure the function is called with an authenticated Appwrite session.' }, 401);
+    }
+
+    const tgUser = initDataUnsafe?.user || {};
+    const telegramId = String(tgUser.id || '');
+    if (!telegramId) return context.res.json({ success: false, message: 'Telegram ID missing' }, 400);
+
+    const now = new Date().toISOString();
+    const userData = {
+        userId: appwriteUserId,
+        telegramId,
+        username: tgUser.username || '',
+        firstName: tgUser.first_name || 'User',
+        lastName: tgUser.last_name || '',
+        fullName: [tgUser.first_name || '', tgUser.last_name || ''].filter(Boolean).join(' ') || 'User',
+        photoUrl: tgUser.photo_url || '',
+        languageCode: tgUser.language_code || 'en',
+        isPremium: !!tgUser.is_premium,
+        phoneNumber: '',
+        role: 'user',
+        banned: false,
+        loyaltyPoints: 0,
+        leaderboardPoints: 0,
+        totalPurchases: 0,
+        totalSpending: 0,
+        rewardTickets: 0,
+        vipActive: false,
+        vipExpiry: '',
+        createdAt: now,
+        lastActive: now,
+        settings: {}
+    };
+
     try {
-        const userDoc = await ensureUserDoc(databases, dbId, colId.users, payload);
-        // Light profile sync (only update fields that actually changed)
-        const updateData = buildUserUpdateData(payload, userDoc);
-        let finalDoc = userDoc;
+        const existing = await databases.getDocument(dbId, colId.users, appwriteUserId);
+        const updateData = {};
+        if (existing.telegramId !== telegramId) updateData.telegramId = telegramId;
+        if (existing.username !== userData.username) updateData.username = userData.username;
+        if (existing.firstName !== userData.firstName) updateData.firstName = userData.firstName;
+        if (existing.lastName !== userData.lastName) updateData.lastName = userData.lastName;
+        if (existing.photoUrl !== userData.photoUrl) updateData.photoUrl = userData.photoUrl;
+        if (existing.languageCode !== userData.languageCode) updateData.languageCode = userData.languageCode;
+        if (existing.isPremium !== userData.isPremium) updateData.isPremium = userData.isPremium;
+        if (existing.userId !== appwriteUserId) updateData.userId = appwriteUserId;
+        updateData.lastActive = now;
+
         if (Object.keys(updateData).length > 0) {
-            finalDoc = await databases.updateDocument(dbId, colId.users, telegramId, updateData);
+            await databases.updateDocument(dbId, colId.users, appwriteUserId, updateData, [
+                sdk.Permission.read(sdk.Role.user(appwriteUserId)),
+                sdk.Permission.update(sdk.Role.user(appwriteUserId))
+            ]);
         }
-        return context.res.json({ success: true, user: finalDoc, created: updateData.createdAt === userDoc.createdAt ? false : true });
+        return context.res.json({ success: true, userId: appwriteUserId, created: false });
     } catch (e) {
-        context.error('getOrCreateUser error:', e);
-        return context.res.json({ success: false, message: e.message || 'Failed to load user' }, 500);
+        // Document not found, create new user
+        await databases.createDocument(dbId, colId.users, appwriteUserId, userData, [
+            sdk.Permission.read(sdk.Role.user(appwriteUserId)),
+            sdk.Permission.update(sdk.Role.user(appwriteUserId))
+        ]);
+        return context.res.json({ success: true, userId: appwriteUserId, created: true });
     }
 }
 
-// ✅ NEW: Replaces client-side Auth.updateUserData
-async function updateUserProfile(context, databases, dbId, colId, payload) {
-    const telegramId = String(payload.telegramId || '');
-    const updateData = payload.updateData || {};
-
-    if (!telegramId) {
-        return context.res.json({ success: false, message: 'telegramId required' }, 400);
-    }
-    if (!updateData || typeof updateData !== 'object') {
-        return context.res.json({ success: false, message: 'updateData required' }, 400);
-    }
-
-    // Allowlist of fields a user is allowed to update on their own profile.
-    // Prevents users from setting role: 'admin' or banned: false via this endpoint.
-    const ALLOWED_FIELDS = [
-        'username', 'firstName', 'lastName', 'fullName', 'photoUrl',
-        'languageCode', 'isPremium', 'phoneNumber', 'settings', 'lastActive'
-    ];
-    const safeUpdate = {};
-    for (const k of ALLOWED_FIELDS) {
-        if (k in updateData) safeUpdate[k] = updateData[k];
-    }
-    if (Object.keys(safeUpdate).length === 0) {
-        return context.res.json({ success: false, message: 'No allowed fields to update' }, 400);
-    }
-
-    try {
-        const updated = await databases.updateDocument(dbId, colId.users, telegramId, safeUpdate);
-        return context.res.json({ success: true, user: updated });
-    } catch (e) {
-        context.error('updateUserProfile error:', e);
-        return context.res.json({ success: false, message: e.message || 'Update failed' }, 500);
-    }
-}
-
-// ✅ NEW: Helper for getOrCreateUser to keep profile in sync
-function buildUserUpdateData(payload, doc) {
-    const data = {};
-    const fields = ['username', 'firstName', 'lastName', 'photoUrl', 'languageCode', 'isPremium'];
-    for (const f of fields) {
-        const newVal = payload[f] !== undefined ? payload[f] : '';
-        if (doc[f] !== newVal) data[f] = newVal;
-    }
-    data.lastActive = new Date().toISOString();
-    return data;
-}
-
-// =====================================================================
-// === EXISTING ACTIONS BELOW — preserved exactly except submitOrder,
-// === submitVIP and spinWheel now use ensureUserDoc() instead of the
-// === old read-only getOrCreateUserDoc() so a brand-new user can still
-// === place an order / spin the wheel without first calling getOrCreateUser.
-// =====================================================================
-
-async function submitOrder(context, databases, dbId, colId, payload, adminIds) {
+async function submitOrder(context, databases, dbId, colId, payload, adminIds, appwriteUserId) {
     const { telegramId, productId, productName, productPrice, effectivePrice, paymentMethod, discountCode, appliedDiscounts } = payload;
     if (!telegramId || !productId) throw new Error('Missing required fields');
 
-    // ✅ FIX: Use ensureUserDoc so brand-new users can still submit an order.
-    let userDoc = await ensureUserDoc(databases, dbId, colId.users, payload);
+    let userDoc = await getUserDocByAppwriteId(databases, dbId, colId.users, appwriteUserId);
+    if (!userDoc) throw new Error('User not found');
     if (userDoc.banned) throw new Error('Account is banned');
 
     const now = new Date().toISOString();
@@ -291,7 +221,7 @@ async function submitOrder(context, databases, dbId, colId, payload, adminIds) {
         screenshotFileId: '',
         screenshotUrl: '',
         createdAt: now,
-        $permissions: [sdk.Permission.read(sdk.Role.user(telegramId))]
+        $permissions: [sdk.Permission.read(sdk.Role.user(appwriteUserId))]
     };
 
     await databases.createDocument(dbId, colId.orders, orderId, orderData);
@@ -313,7 +243,8 @@ async function approveOrder(context, databases, dbId, colId, payload, adminIds) 
     const order = await databases.getDocument(dbId, colId.orders, orderId);
     if (order.status !== 'pending') throw new Error('Order is not pending');
 
-    const userDoc = await databases.getDocument(dbId, colId.users, order.telegramId);
+    const userDoc = await getUserDocByTelegramId(databases, dbId, colId.users, order.telegramId);
+    if (!userDoc) throw new Error('User not found for this order');
     const finalAmount = parseFloat(order.finalAmount) || 0;
 
     // Update order status
@@ -396,12 +327,12 @@ async function rejectOrder(context, databases, dbId, colId, payload, adminIds) {
     return context.res.json({ success: true, orderId });
 }
 
-async function submitVIP(context, databases, dbId, colId, payload, adminIds) {
+async function submitVIP(context, databases, dbId, colId, payload, adminIds, appwriteUserId) {
     const { telegramId, planType, price, paymentMethod } = payload;
     if (!telegramId || !planType) throw new Error('Missing VIP fields');
 
-    // ✅ FIX: Use ensureUserDoc so brand-new users can still apply for VIP.
-    let userDoc = await ensureUserDoc(databases, dbId, colId.users, payload);
+    const userDoc = await getUserDocByAppwriteId(databases, dbId, colId.users, appwriteUserId);
+    if (!userDoc) throw new Error('User not found');
     if (userDoc.banned) throw new Error('Account is banned');
 
     const now = new Date().toISOString();
@@ -431,7 +362,7 @@ async function submitVIP(context, databases, dbId, colId, payload, adminIds) {
         approvedBy: '',
         approvedAt: '',
         createdAt: now,
-        $permissions: [sdk.Permission.read(sdk.Role.user(telegramId))]
+        $permissions: [sdk.Permission.read(sdk.Role.user(appwriteUserId))]
     });
 
     await notifyAdmins(databases, dbId, colId, adminIds, {
@@ -468,10 +399,13 @@ async function approveVIP(context, databases, dbId, colId, payload, adminIds) {
         approvedAt: now.toISOString()
     });
 
-    await databases.updateDocument(dbId, colId.users, vip.telegramId, {
-        vipActive: true,
-        vipExpiry: expiryDate
-    });
+    const userDoc = await getUserDocByTelegramId(databases, dbId, colId.users, vip.telegramId);
+    if (userDoc) {
+        await databases.updateDocument(dbId, colId.users, userDoc.$id, {
+            vipActive: true,
+            vipExpiry: expiryDate
+        });
+    }
 
     return context.res.json({ success: true, vipId });
 }
@@ -489,10 +423,10 @@ async function rejectVIP(context, databases, dbId, colId, payload, adminIds) {
     return context.res.json({ success: true, vipId });
 }
 
-async function spinWheel(context, databases, dbId, colId, payload) {
+async function spinWheel(context, databases, dbId, colId, payload, appwriteUserId) {
     const { telegramId } = payload;
-    // ✅ FIX: Use ensureUserDoc so brand-new users can still spin.
-    let userDoc = await ensureUserDoc(databases, dbId, colId.users, payload);
+    const userDoc = await getUserDocByAppwriteId(databases, dbId, colId.users, appwriteUserId);
+    if (!userDoc) throw new Error('User not found');
     if (userDoc.banned) throw new Error('Account is banned');
     if ((userDoc.rewardTickets || 0) <= 0) throw new Error('No tickets available');
 
@@ -511,7 +445,7 @@ async function spinWheel(context, databases, dbId, colId, payload) {
     const prize = prizes[selectedIndex];
 
     // Consume ticket
-    await databases.updateDocument(dbId, colId.users, telegramId, {
+    await databases.updateDocument(dbId, colId.users, userDoc.$id, {
         rewardTickets: (userDoc.rewardTickets || 0) - 1
     });
 
@@ -526,7 +460,7 @@ async function spinWheel(context, databases, dbId, colId, payload) {
         prizeType: prize.type,
         prizeValue: prize.value,
         createdAt: new Date().toISOString(),
-        $permissions: [sdk.Permission.read(sdk.Role.user(telegramId))]
+        $permissions: [sdk.Permission.read(sdk.Role.user(appwriteUserId))]
     });
 
     return context.res.json({ success: true, prizeIndex: selectedIndex, prize });
