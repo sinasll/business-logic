@@ -72,6 +72,14 @@ module.exports = async function (context) {
                 return await spinWheel(context, databases, dbId, colId, payload, appwriteUserId);
             case 'validateDiscountCode':
                 return await validateDiscountCode(context, databases, dbId, colId, payload);
+            case 'getUser':
+                return await getUser(context, databases, dbId, colId, payload);
+            case 'updateUser':
+                return await updateUser(context, databases, dbId, colId, payload);
+            case 'getVIPStatus':
+                return await getVIPStatus(context, databases, dbId, colId, payload);
+            case 'getActiveVIP':
+                return await getActiveVIP(context, databases, dbId, colId, payload);
             default:
                 return context.res.json({ success: false, message: 'Unknown action' }, 400);
         }
@@ -560,5 +568,63 @@ async function notifyAdmins(databases, dbId, colId, adminIds, notification) {
         }
     } catch (e) {
         console.error('Admin notification error:', e);
+    }
+}
+
+// === New client-facing handlers (called via executeFunction) ===
+
+async function getUser(context, databases, dbId, colId, payload) {
+    const { telegramId } = payload;
+    if (!telegramId) return context.res.json({ success: false, message: 'telegramId required' });
+    const user = await getUserDocByTelegramId(databases, dbId, colId.users, telegramId);
+    return context.res.json({ success: !!user, user: user || null });
+}
+
+async function updateUser(context, databases, dbId, colId, payload) {
+    const { telegramId, update } = payload;
+    if (!telegramId || !update) return context.res.json({ success: false, message: 'telegramId and update required' });
+    const user = await getUserDocByTelegramId(databases, dbId, colId.users, telegramId);
+    if (!user) return context.res.json({ success: false, message: 'User not found' });
+    await databases.updateDocument(dbId, colId.users, user.$id, update);
+    const fresh = await getUserDocByTelegramId(databases, dbId, colId.users, telegramId);
+    return context.res.json({ success: true, user: fresh });
+}
+
+async function getVIPStatus(context, databases, dbId, colId, payload) {
+    const { telegramId } = payload;
+    if (!telegramId) return context.res.json({ success: false, message: 'telegramId required' });
+    try {
+        const result = await databases.listDocuments(dbId, colId.vipMembers, [
+            sdk.Query.equal('telegramId', String(telegramId)),
+            sdk.Query.orderDesc('$createdAt'),
+            sdk.Query.limit(1)
+        ]);
+        const membership = result.documents[0] || null;
+        return context.res.json({ success: true, membership });
+    } catch (e) {
+        return context.res.json({ success: false, message: e.message });
+    }
+}
+
+async function getActiveVIP(context, databases, dbId, colId, payload) {
+    const limit = payload.limit || 15;
+    try {
+        const result = await databases.listDocuments(dbId, colId.vipMembers, [
+            sdk.Query.equal('status', 'active'),
+            sdk.Query.orderDesc('approvedAt'),
+            sdk.Query.limit(limit)
+        ]);
+        // Only return safe public fields
+        const members = result.documents.map(m => ({
+            telegramId: m.telegramId,
+            username: m.username,
+            firstName: m.firstName,
+            photoUrl: '', // populated client-side if needed
+            planType: m.planType,
+            expiryDate: m.expiryDate
+        }));
+        return context.res.json({ success: true, members });
+    } catch (e) {
+        return context.res.json({ success: false, message: e.message });
     }
 }
