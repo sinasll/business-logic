@@ -4,7 +4,8 @@
  * wheel spin logic, loyalty/leaderboard updates, VIP calculations.
  */
 
-import { Client, Databases, Storage, InputFile, Query } from 'node-appwrite';
+import { Client, Databases, Storage, Query } from 'node-appwrite';
+import { InputFile } from 'node-appwrite/file';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
